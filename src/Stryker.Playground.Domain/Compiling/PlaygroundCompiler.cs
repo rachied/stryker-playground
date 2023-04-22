@@ -1,17 +1,23 @@
 ﻿using System.Text;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Emit;
 using Microsoft.Extensions.Logging.Abstractions;
 using Stryker.Core.Common.InjectedHelpers;
 using Stryker.Core.Common.Logging;
 using Stryker.Core.Common.Mutants;
+using Stryker.Playground.Domain.Compiling.Rollback;
 
 namespace Stryker.Playground.Domain.Compiling;
 
 public class PlaygroundCompiler : IPlaygroundCompiler
 {
+    private const int MaxAttempt = 50;
+    private IRollbackProcess _rollbackProcess;
+
     public PlaygroundCompiler()
     {
+        _rollbackProcess = new RollbackProcess();
         ApplicationLogging.LoggerFactory = NullLoggerFactory.Instance;
     }
     
@@ -37,20 +43,96 @@ public class PlaygroundCompiler : IPlaygroundCompiler
             SourceCode = mutatedTree.ToFullString(),
             UsingStatementNamespaces = input.UsingStatementNamespaces,
         };
+        
+        var compilation = GetCompilation(mutationCompileInput);
+        using var ilStream = new MemoryStream();
+        
+        // first try compiling
+        var retryCount = 1;
+        (var rollbackProcessResult, var emitResult, retryCount) = TryCompilation(ilStream, compilation, null, false, retryCount);
 
-        var compilationResult = await Compile(mutationCompileInput);
+        // If compiling failed and the error has no location, log and throw exception.
+        if (!emitResult.Success && emitResult.Diagnostics.Any(diagnostic => diagnostic.Location == Location.None && diagnostic.Severity == DiagnosticSeverity.Error))
+        {
+            Console.WriteLine("Failed to build the mutated assembly due to unrecoverable error: {0}",
+                emitResult.Diagnostics.First(diagnostic => diagnostic.Location == Location.None && diagnostic.Severity == DiagnosticSeverity.Error));
+            throw new AggregateException("General Build Failure detected.");
+        }
+
+        for (var count = 1; !emitResult.Success && count < MaxAttempt; count++)
+        {
+            // compilation did not succeed. let's compile a couple times more for good measure
+            (rollbackProcessResult, emitResult, retryCount) = TryCompilation(ilStream, rollbackProcessResult?.Compilation ?? compilation, emitResult, retryCount == MaxAttempt - 1, retryCount);
+        }
 
         return new MutantCompilationResult
         {
             OriginalTree = sourceCodeTree,
             Mutants = orchestrator.Mutants,
-            Diagnostics = compilationResult.Diagnostics,
-            EmittedBytes = compilationResult.EmittedBytes,
-            Success = compilationResult.Success,
+            Diagnostics = emitResult.Diagnostics,
+            EmittedBytes = emitResult.Success ? ilStream.ToArray() : null,
+            Success = emitResult.Success,
         };
     }
     
+    private (RollbackProcessResult, EmitResult, int) TryCompilation(
+        Stream ms,
+        CSharpCompilation compilation,
+        EmitResult? previousEmitResult,
+        bool lastAttempt,
+        int retryCount)
+    {
+        RollbackProcessResult rollbackProcessResult = null;
+
+        if (previousEmitResult != null)
+        {
+            // remove broken mutations
+            rollbackProcessResult = _rollbackProcess.Start(compilation, previousEmitResult.Diagnostics, lastAttempt, false);
+            compilation = rollbackProcessResult.Compilation;
+        }
+
+        // reset the memoryStream
+        ms.SetLength(0);
+
+        var emitResult = compilation.Emit(ms);
+
+        LogEmitResult(emitResult);
+
+        return (rollbackProcessResult, emitResult, ++retryCount);
+    }
+    
+    private void LogEmitResult(EmitResult result)
+    {
+        if (!result.Success)
+        {
+            Console.WriteLine("Compilation failed");
+
+            foreach (var err in result.Diagnostics.Where(x => x.Severity is DiagnosticSeverity.Error))
+            {
+                Console.WriteLine("{0}, {1}", err?.GetMessage() ?? "No message", err?.Location.SourceTree?.FilePath ?? "Unknown filepath");
+            }
+        }
+        else
+        {
+            Console.WriteLine("Compilation successful");
+        }
+    }
+    
     public async Task<CompilationResult> Compile(CompilationInput input)
+    {
+        await using var codeStream = new MemoryStream();
+        
+        var result = GetCompilation(input).Emit(codeStream);
+
+        return new CompilationResult()
+        {
+            Diagnostics = result.Diagnostics,
+            Success = result.Success,
+            EmittedBytes = result.Success ? codeStream.ToArray() : null,
+        };
+    }
+
+    public CSharpCompilation GetCompilation(CompilationInput input)
     {
         var compilationOptions = new CSharpCompilationOptions(
                 OutputKind.DynamicallyLinkedLibrary, 
@@ -63,22 +145,11 @@ public class PlaygroundCompiler : IPlaygroundCompiler
         var injectionTrees = GetInstrumentationSyntaxTrees();
 
         var isoDateTime = DateTime.Now.ToString("yyyyMMddTHHmmss");
-        var compilation = CSharpCompilation.Create($"PlaygroundBuild-{isoDateTime}.dll")
+        return CSharpCompilation.Create($"PlaygroundBuild-{isoDateTime}.dll")
             .WithOptions(compilationOptions)
             .WithReferences(input.References)
             .AddSyntaxTrees(sourceCodeTree, unitTestTree)
             .AddSyntaxTrees(injectionTrees);
-
-        await using var codeStream = new MemoryStream();
-        
-        var result = compilation.Emit(codeStream);
-
-        return new CompilationResult()
-        {
-            Diagnostics = result.Diagnostics,
-            Success = result.Success,
-            EmittedBytes = result.Success ? codeStream.ToArray() : null,
-        };
     }
     
     private static List<SyntaxTree> GetInstrumentationSyntaxTrees()
