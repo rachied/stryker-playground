@@ -1,8 +1,9 @@
 'use strict';
 
 // Todd Tanner
-// 2022
+// 2022 - 2023
 // SpawnDev.BlazorJS.WebWorkers
+// _content/SpawnDev.BlazorJS.WebWorkers/spawndev.blazorjs.webworkers.js
 
 var checkIfGlobalThis = function (it) {
     return it && it.Math == Math && it;
@@ -20,14 +21,6 @@ const globalThisObj =
     (function () { return this; })() || Function('return this')();
 
 const globalThisTypeName = globalThisObj.constructor.name;
-
-var dynamicImportSupported = true;
-// this detection is a bit of a hack but dynamic import support testing is hit or miss also
-// TODO - test on Firefox mobile/mac/linux
-if (navigator.userAgent && navigator.userAgent.indexOf('Firefox') > -1) {
-    dynamicImportSupported = false;
-    console.log('WARNING: Firefox may not support dynamic import in workers. WebWorkers may not work.');
-}
 
 // important for SharedWorker
 // catch any incoming connetions that happen while .Net is loading
@@ -47,28 +40,23 @@ if (globalThisTypeName == 'SharedWorkerGlobalScope') {
 
 var disableHotReload = true;
 var verboseWebWorkers = location.search.indexOf('verbose=true') > -1;
-// at the moment verbose must be false because an unknown issue is causing Blazor to fail without any errors if it is enabled
 var consoleLog = function () {
     if (!verboseWebWorkers) return;
     console.log(...arguments);
 };
 
-// _content/SpawnDev.BlazorJS.WebWorkers/spawndev.blazorjs.webworkers.js
 consoleLog('spawndev.blazorjs.webworkers: started');
 consoleLog('location.href', location.href);
-var _frameworkPath = '';
-var _appPath = '';
-if (location.href.indexOf('_content/SpawnDev.BlazorJS.WebWorkers') > 0) {
-    _frameworkPath = new URL(`../../_framework/`, location.href).toString();
-    _appPath = new URL(`../../`, location.href).toString();
-} else {
-    _frameworkPath = new URL(`_framework/`, location.href).toString();
-    _appPath = new URL(`./`, location.href).toString();
-}
-consoleLog('_frameworkPath', _frameworkPath);
+// location.href is this script
+// location.href == 'https://localhost:7191/_content/SpawnDev.BlazorJS.WebWorkers/spawndev.blazorjs.webworkers.js?verbose=false'
 
 consoleLog('spawndev.blazorjs.webworkers: loading fake window environment');
-importScripts(_frameworkPath + '../_content/SpawnDev.BlazorJS.WebWorkers/spawndev.blazorjs.webworkers.faux-env.js');
+importScripts('spawndev.blazorjs.webworkers.faux-env.js');
+// barebones dom has been created
+// set document.baseURI
+document.baseURI = new URL(`../../`, location.href).toString();
+consoleLog('document.baseURI', document.baseURI);
+// document.baseURI == 'https://localhost:7191/'
 
 var stallForDebuggerSeconds = 0;
 if (stallForDebuggerSeconds) {
@@ -84,18 +72,34 @@ if (disableHotReload) {
     globalThisObj[scriptInjectedSentinel] = true
 }
 
-var initWebWorkerBlazor = async () => {
-    // the app base directory is 2 folders up
-    if (document.baseURI.indexOf('_content/') > 0) {
-        document.baseURI = new URL(document.baseURI + '../../').toString();
+async function hasDynamicImport() {
+    try {
+        await import('data:text/javascript;base64,Cg==');
+        return true;
+    } catch (e) {
+        return false;
     }
-    consoleLog('document.baseURI', document.baseURI);
+}
+
+var initWebWorkerBlazor = async function () {
+    var dynamicImportSupported = await hasDynamicImport();
+    // this detection is a bit of a hack but dynamic import support testing is hit or miss also
+    // https://bugzilla.mozilla.org/show_bug.cgi?id=1540913
+    if (!dynamicImportSupported) {
+        consoleLog("import is not supported. A workaround will be used.");
+    } else {
+        consoleLog('import is supported');
+    }
+
+
+    async function getText(href) {
+        var response = await fetch(new URL(href, document.baseURI), {
+            cache: 'force-cache',
+        });
+        return await response.text();
+    }
     // Get index.html
-    var indexHtmlUri = new URL('index.html', document.baseURI);
-    var response = await fetch(indexHtmlUri, {
-        cache: 'no-cache',
-    });
-    var indexHtmlSrc = await response.text();
+    var indexHtmlSrc = await getText('index.html');
     var indexHtmlScripts = [];
     var blazorWebAssemblyJSIndex = -1;
     function getIndexHtmlScripts() {
@@ -123,6 +127,53 @@ var initWebWorkerBlazor = async () => {
         }
     }
     getIndexHtmlScripts();
+    globalThisObj.importOverride = async function (src) {
+        consoleLog('importOverride', src);
+        var jsStr = await getText(src);
+        jsStr = fixModuleScript(jsStr);
+        let fn = new Function(jsStr);
+        var ret = fn.apply(createProxiedObject(globalThisObj), []);
+        if (!ret) ret = createProxiedObject({});
+        return ret;
+    }
+    function fixModuleScript(jsStr) {
+        // handle things that are automatically handled by import
+        // import.meta.url
+        jsStr = jsStr.replace(new RegExp('\\bimport\\.meta\\.url\\b', 'g'), `document.baseURI`);
+        // import.meta
+        jsStr = jsStr.replace(new RegExp('\\bimport\\.meta\\b', 'g'), `{ url: location.href }`);
+        // import
+        jsStr = jsStr.replace(new RegExp('\\bimport\\(', 'g'), 'importOverride(');
+        // export
+        // https://www.geeksforgeeks.org/what-is-export-default-in-javascript/
+        // handle exports from
+        // lib modules
+        // Ex(_content/SpawnDev.BlazorJS/SpawnDev.BlazorJS.lib.module.js)
+        // export function beforeStart(options, extensions) {
+        // export function afterStarted(options, extensions) {
+        var exportPatt = /\bexport[ \t]+function[ \t]+([^ \t(]+)/g;
+        jsStr = jsStr.replace(exportPatt, '_exportsOverride.$1 = function $1');
+        // handle exports from
+        // dotnet.7.0.0.amub20uvka.js
+        // export default createDotnetRuntime
+        exportPatt = /\bexport[ \t]+default[ \t]+([^ \t;]+)/g;
+        jsStr = jsStr.replace(exportPatt, '_exportsOverride.default = $1');
+        // export { dotnet, exit, INTERNAL };
+        exportPatt = /\bexport[ \t]+(\{[^}]+\})/g;
+        jsStr = jsStr.replace(exportPatt, '_exportsOverride = Object.assign(_exportsOverride, $1)');
+        //var n = 0;
+        //var m = null;
+        //exportPatt = new RegExp('\\bexport\\b.*?(?:;|$)', 'gm');
+        //do {
+        //    m = exportPatt.exec(jsStr);
+        //    if (m) {
+        //        n++;
+        //        console.log('export', n, m[0]);
+        //    }
+        //} while (m);
+        var modulize = `let _exportsOverride = {}; ${jsStr}; return _exportsOverride;`;
+        return modulize;
+    }
     async function initializeBlazor() {
 
         // setup standard document
@@ -144,80 +195,16 @@ var initWebWorkerBlazor = async () => {
             scriptEl.setAttribute('src', s);
             if (i == blazorWebAssemblyJSIndex) {
                 scriptEl.setAttribute('autostart', "false");
+                if (!dynamicImportSupported) {
+                    // convert dynamic imports in blazorWebAssembly and its imports
+                    let jsStr = await getText(s);
+                    jsStr = fixModuleScript(jsStr);
+                    scriptEl.text = jsStr;
+                }
             }
         }
-        
-        //blazorWASMScriptEl.setAttribute('src', '_content/SpawnDev.BlazorJS.WebWorkers/blazor.webassembly.pretty.js');
         // init document
-        if (dynamicImportSupported) {
-            document.initDocument();
-        }
-        else {
-            consoleLog('Loading workaround to counter lack of dynamic import support in some browsers (Firefox, others?)');
-            var integrity = '';
-            //var blazorWasmJsUri = new URL('_content/SpawnDev.BlazorJS.WebWorkers/blazor.webassembly.pretty.js', document.baseURI);
-            var blazorWasmJsUri = new URL('_framework/blazor.webassembly.js', document.baseURI);
-            var response = await fetch(blazorWasmJsUri, {
-                cache: 'no-cache',
-                //integrity: integrity,
-            });
-            var jsStr = await response.text();
-            function fixModuleScript(jsStr) {
-                // handle things that are automatically handled by import
-                // import.meta.url
-                jsStr = jsStr.replace(new RegExp('\\bimport\\.meta\\.url\\b', 'g'), `document.baseURI`);
-                // import.meta
-                jsStr = jsStr.replace(new RegExp('\\bimport\\.meta\\b', 'g'), `{ url: location.href }`);
-                // import
-                jsStr = jsStr.replace(new RegExp('\\bimport\\(', 'g'), 'importOverride(');
-                // export
-                // https://www.geeksforgeeks.org/what-is-export-default-in-javascript/
-                // handle exports from
-                // lib modules
-                // Ex(_content/SpawnDev.BlazorJS/SpawnDev.BlazorJS.lib.module.js)
-                // export function beforeStart(options, extensions) {
-                // export function afterStarted(options, extensions) {
-                var exportPatt = /\bexport[ \t]+function[ \t]+([^ \t(]+)/g;
-                jsStr = jsStr.replace(exportPatt, '_exportsOverride.$1 = function $1');
-                // handle exports from
-                // dotnet.7.0.0.amub20uvka.js
-                // export default createDotnetRuntime
-                exportPatt = /\bexport[ \t]+default[ \t]+([^ \t;]+)/g;
-                jsStr = jsStr.replace(exportPatt, '_exportsOverride.default = $1');
-                // export { dotnet, exit, INTERNAL };
-                exportPatt = /\bexport[ \t]+(\{[^}]+\})/g;
-                jsStr = jsStr.replace(exportPatt, '_exportsOverride = Object.assign(_exportsOverride, $1)');
-                //var n = 0;
-                //var m = null;
-                //exportPatt = new RegExp('\\bexport\\b.*?(?:;|$)', 'gm');
-                //do {
-                //    m = exportPatt.exec(jsStr);
-                //    if (m) {
-                //        n++;
-                //        console.log('export', n, m[0]);
-                //    }
-                //} while (m);
-                var modulize = `let _exportsOverride = {}; ${jsStr}; return _exportsOverride;`;
-                return modulize;
-            }
-            globalThisObj.importOverride = async function (src) {
-                consoleLog('importOverride', src);
-                var response = await fetch(src, {
-                    cache: 'no-cache',
-                    //integrity: integrity,
-                });
-                var jsStr = await response.text();
-                jsStr = fixModuleScript(jsStr);
-                let fn = new Function(jsStr);
-                var ret = fn.apply(createProxiedObject(globalThisObj), []);
-                if (!ret) ret = createProxiedObject({});
-                return ret;
-            }
-            jsStr = fixModuleScript(jsStr);
-            //console.log("jsStr", jsStr);
-            blazorWASMScriptEl.text = jsStr;
-            document.initDocument();
-        }
+        document.initDocument();
     }
     await initializeBlazor();
 
@@ -225,37 +212,9 @@ var initWebWorkerBlazor = async () => {
     // https://learn.microsoft.com/en-us/aspnet/core/blazor/fundamentals/environments?view=aspnetcore-7.0
     Blazor.start({
         loadBootResource: function (type, name, defaultUri, integrity) {
-            if (type == 'configuration') {
-                var newUri = `${_appPath}${name}`;
-                //console.log(`Loading: '${type}', '${name}', '${defaultUri}', '${integrity}', '${newUri}'`);
-                return newUri;
-            }
-            else {
-                var newUri = `${_frameworkPath}${name}`;
-                //console.log(`Loading: '${type}', '${name}', '${defaultUri}', '${integrity}', '${newUri}'`);
-                if (name === 'blazor.boot.json') {
-                    return (async () => {
-                        var response = await fetch(newUri, {
-                            cache: 'no-cache',
-                            integrity: integrity,
-                        });
-                        var responseClone = response.clone();
-                        var json = await responseClone.json();
-                        // this is where we can modify json.entryAssembly or other boot config settings
-                        //consoleLog('blazor.boot.json', json);
-                        //json.debugBuild = false;
-                        //json.linkerEnabled = false;
-                        consoleLog('blazor.boot.json::entryAssembly', json.entryAssembly);
-                        var newRsponse = new Response(JSON.stringify(json), response);
-                        return newRsponse;
-                    })();
-                } else if (name === 'blazor.webassembly.js') {
-
-                }
-            }
-            return newUri;
+            var newURL = new URL(defaultUri, document.baseURI);
+            return newURL.toString();
         }
     });
-
 };
 initWebWorkerBlazor();
